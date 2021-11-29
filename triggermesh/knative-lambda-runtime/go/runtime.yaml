@@ -1,0 +1,83 @@
+# Copyright 2019 TriggerMesh, Inc
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: tekton.dev/v1alpha1
+kind: Task
+metadata:
+  name: knative-go-runtime
+spec:
+  params:
+  - name: IMAGE
+    description: Where to store resulting image
+  - name: SSH_KEY
+    description: SSH key
+    default: "placeholder"
+  - name: DIRECTORY
+    description: The subdirectory of the workspace/repo
+    default: "."
+  resources:
+    inputs:
+    - name: sources
+      targetPath: /workspace
+      type: git
+  steps:
+  - name: dockerfile
+    image: registry.cn-hangzhou.aliyuncs.com/freedom124/kaniko-executor-debug:v0.8.0
+    command:
+    - /busybox/sh
+    args:
+    - -c
+    - |
+      cd /workspace/workspace/$(inputs.params.DIRECTORY)
+      cat <<EOF > Dockerfile
+        FROM golang:alpine
+        # Skip known public key check to be able to pull from private repositories
+        ENV GIT_SSH_COMMAND "ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no"
+        RUN apk --no-cache add git ca-certificates openssh \
+        && go get github.com/triggermesh/aws-custom-runtime \
+        && go get github.com/triggermesh/knative-lambda-runtime/go
+        RUN mv /go/bin/go /go/bin/bootstrap
+        WORKDIR /go/src/handler
+        COPY . .
+        RUN if [ -f "$HOME/.ssh/id_$(inputs.params.SSH_KEY)" ]; then \
+            eval "\$(ssh-agent -s)"; \
+            ssh-add $HOME/.ssh/id_$(inputs.params.SSH_KEY); \
+        fi \
+        && if [ ! -f "go.mod" ]; then \
+             go mod init handler; \
+           fi \
+        && go get -d -v \
+        && go build -o handler
+
+        FROM alpine
+        WORKDIR /opt
+        ENV LAMBDA_TASK_ROOT "/opt"
+        ENV _HANDLER "handler"
+        COPY --from=0 /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+        COPY --from=0 /go/bin/ /opt
+        COPY --from=0 /go/src/handler/handler /opt
+        ENTRYPOINT ["/opt/aws-custom-runtime"]
+      EOF
+  - name: export
+    image: registry.cn-hangzhou.aliyuncs.com/freedom124/kaniko-executor-debug:v0.8.0
+    args:
+    - --context=/workspace/workspace/$(inputs.params.DIRECTORY)
+    - --dockerfile=Dockerfile
+    - --destination=$(inputs.params.IMAGE)
+    # Workaround not to use default config which requires gcloud credentials
+    # to pull base image from public gcr registry
+    # https://groups.google.com/d/msg/kaniko-users/r5yoP_Ejm_c/ExoEXksDBAAJ
+    env:
+    - name: DOCKER_CONFIG
+      value: "/"
